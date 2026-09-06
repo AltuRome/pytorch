@@ -80,16 +80,27 @@ def _detect_cycles(
     return "no cycle detected"
 
 
-def _graph_device_type(graph: Graph | None) -> str:
+def _graph_device_types(graph: Graph | None) -> frozenset[str]:
+    """Every device type named by the graph's meta values, args, or device
+    conversions. Values with no device (SymInt, int, None) contribute nothing;
+    an empty result means the graph names no device, which is not "cpu".
+    """
     if graph is None:
-        return "cpu"
+        return frozenset()
 
-    def _device_type(x: Any) -> str:
+    def _device_type(x: Any) -> str | None:
         if isinstance(x, torch.device):
             return x.type
         if isinstance(x, torch.Tensor):
             return x.device.type
-        return "cpu"
+        if isinstance(x, str):
+            # A device named as a string: device="mps", x.to("cpu"). Not every
+            # string is a device, so let torch.device reject the ones that fail.
+            try:
+                return torch.device(x).type
+            except (RuntimeError, ValueError):
+                return None
+        return None
 
     def _flatten_meta(node: Node, key: str) -> list[Any]:
         if key not in node.meta:
@@ -97,21 +108,23 @@ def _graph_device_type(graph: Graph | None) -> str:
         flat, _ = tree_flatten(node.meta[key])
         return flat
 
+    devices: set[str] = set()
     for node in graph.nodes:
         for key in ("val", "example_value"):
             for obj in _flatten_meta(node, key):
-                return _device_type(obj)
+                if (device := _device_type(obj)) is not None:
+                    devices.add(device)
 
         # Check for device conversions
         if node.op == "call_method":
             for gpu in ["cuda", "xpu"]:
-                if node.target == gpu:
-                    return gpu
-                if node.target == "to" and gpu in node.args:
-                    return gpu
+                if node.target == gpu or (node.target == "to" and gpu in node.args):
+                    devices.add(gpu)
 
         # Check args/kwargs for non-CPU device specs
         flat_args, _ = tree_flatten((node.args, node.kwargs))
         for obj in flat_args:
-            return _device_type(obj)
-    return "cpu"
+            if (device := _device_type(obj)) is not None:
+                devices.add(device)
+    # meta is an abstract device, never a runtime requirement of the host.
+    return frozenset(devices) - {"meta"}
